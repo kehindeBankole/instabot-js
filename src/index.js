@@ -4,9 +4,11 @@ import fs from 'node:fs';
 import path from 'node:path';
 import express from 'express';
 import Database from 'better-sqlite3';
+import XLSX from 'xlsx';
 
 const config = loadConfig();
 let store;
+let catalog;
 
 function loadConfig() {
   return {
@@ -16,6 +18,7 @@ function loadConfig() {
     igUserId: process.env.IG_USER_ID || '',
     igPageId: process.env.IG_PAGE_ID || '',
     igPageAccessToken: process.env.IG_PAGE_ACCESS_TOKEN || '',
+    userAccessToken: process.env.IG_USER_ACCESS_TOKEN || '',
     openAIAPIKey: process.env.OPENAI_API_KEY || '',
     openAIModel: process.env.OPENAI_MODEL || 'gpt-4o-mini',
     systemPrompt: process.env.IG_BOT_SYSTEM_PROMPT || 'You are an Instagram assistant. Be concise, friendly, and helpful. Keep replies under 3 short lines unless asked for more.',
@@ -23,9 +26,12 @@ function loadConfig() {
     followupDelayMs: parseDurationMs(process.env.FOLLOWUP_DELAY || '2h'),
     followupMaxPerUser: parseInt(process.env.FOLLOWUP_MAX_PER_USER || '1', 10),
     dataFile: process.env.DATA_FILE || 'data/instabot.db',
+    productSheetPath: process.env.PRODUCT_SHEET_PATH || '',
+    productSheetReloadMs: parseInt(process.env.PRODUCT_SHEET_RELOAD_MS || '300000', 10),
     requestTimeoutMs: parseInt(process.env.REQUEST_TIMEOUT_MS || '30000', 10),
     logPayloads: String(process.env.LOG_PAYLOADS || 'false').toLowerCase() === 'true',
     dedupeWindowHours: parseInt(process.env.DEDUPE_WINDOW_HOURS || '72', 10),
+    sendProductImages: String(process.env.SEND_PRODUCT_IMAGES || 'true').toLowerCase() === 'true',
   };
 }
 
@@ -85,6 +91,7 @@ class SqliteStore {
         lastBotAt: null,
         followupCount: 0,
         nextFollowupAt: null,
+        escalated: false,
       };
     }
     return JSON.parse(row.state_json);
@@ -112,16 +119,162 @@ class SqliteStore {
   }
 }
 
+class ProductCatalog {
+  constructor(sheetPath) {
+    this.sheetPath = sheetPath;
+    this.products = [];
+    this.lastLoadedAt = null;
+  }
+
+  async load() {
+    if (!this.sheetPath) {
+      this.products = [];
+      return;
+    }
+
+    const rows = await loadSheetRows(this.sheetPath);
+    this.products = rows.map(normalizeProductRow).filter(Boolean);
+    this.lastLoadedAt = new Date().toISOString();
+    logInfo(`product catalog loaded count=${this.products.length}`);
+  }
+
+  search(query, limit = 5) {
+    const q = normalizeFreeText(query);
+    if (!q) return [];
+    const scored = this.products.map((product) => ({
+      product,
+      score: scoreProduct(product, q),
+    }))
+      .filter((item) => item.score > 0)
+      .sort((a, b) => b.score - a.score)
+      .slice(0, limit);
+    return scored.map((item) => item.product);
+  }
+
+  getById(id) {
+    const needle = String(id || '').trim().toLowerCase();
+    if (!needle) return null;
+    return this.products.find((product) => [product.id, product.sku, product.name]
+      .filter(Boolean)
+      .some((value) => String(value).trim().toLowerCase() === needle)) || null;
+  }
+}
+
+async function loadSheetRows(sheetPath) {
+  const isUrl = /^https?:\/\//i.test(sheetPath);
+  let buffer;
+  let text;
+
+  if (isUrl) {
+    const response = await fetchWithTimeout(sheetPath, {}, config.requestTimeoutMs);
+    if (!response.ok) throw new Error(`product sheet fetch failed status=${response.status}`);
+    const arr = await response.arrayBuffer();
+    buffer = Buffer.from(arr);
+    text = buffer.toString('utf8');
+  } else {
+    const abs = path.resolve(sheetPath);
+    buffer = fs.readFileSync(abs);
+    text = buffer.toString('utf8');
+  }
+
+  const lower = sheetPath.toLowerCase();
+  if (lower.endsWith('.json')) {
+    const parsed = JSON.parse(text);
+    return Array.isArray(parsed) ? parsed : parsed.rows || [];
+  }
+
+  if (lower.endsWith('.csv') || lower.includes('/export?format=csv')) {
+    const wb = XLSX.read(text, { type: 'string' });
+    const sheet = wb.Sheets[wb.SheetNames[0]];
+    return XLSX.utils.sheet_to_json(sheet, { defval: '' });
+  }
+
+  const wb = XLSX.read(buffer, { type: 'buffer' });
+  const sheet = wb.Sheets[wb.SheetNames[0]];
+  return XLSX.utils.sheet_to_json(sheet, { defval: '' });
+}
+
+function normalizeProductRow(row) {
+  if (!row || typeof row !== 'object') return null;
+  const normalized = {};
+  for (const [key, value] of Object.entries(row)) {
+    normalized[normalizeKey(key)] = String(value ?? '').trim();
+  }
+
+  const name = normalized.productname || normalized.name || normalized.title;
+  if (!name) return null;
+
+  const imageUrls = [
+    normalized.imageurl,
+    normalized.imageurl2,
+    normalized.imageurl3,
+    normalized.variantimageurl,
+    normalized.image,
+  ].filter(Boolean);
+
+  return {
+    id: normalized.id || normalized.productid || normalized.sku || name,
+    sku: normalized.sku || normalized.productcode || '',
+    name,
+    description: normalized.description || normalized.productdescription || '',
+    price: normalized.price || normalized.amount || '',
+    stock: normalized.stock || normalized.availability || normalized.instock || '',
+    variant: normalized.variant || normalized.variants || normalized.size || normalized.color || '',
+    category: normalized.category || '',
+    imageUrls,
+    primaryImageUrl: imageUrls[0] || '',
+    raw: normalized,
+    searchText: normalizeFreeText([
+      normalized.id,
+      normalized.sku,
+      name,
+      normalized.description,
+      normalized.price,
+      normalized.stock,
+      normalized.variant,
+      normalized.category,
+    ].filter(Boolean).join(' ')),
+  };
+}
+
+function normalizeKey(key) {
+  return String(key || '').toLowerCase().replace(/[^a-z0-9]/g, '');
+}
+
+function normalizeFreeText(text) {
+  return String(text || '').toLowerCase().replace(/[^a-z0-9\s]/g, ' ').replace(/\s+/g, ' ').trim();
+}
+
+function scoreProduct(product, query) {
+  if (!query) return 0;
+  const terms = query.split(' ').filter((term) => term.length > 1);
+  let score = 0;
+
+  for (const term of terms) {
+    if (product.name.toLowerCase().includes(term)) score += 8;
+    if (product.sku.toLowerCase().includes(term)) score += 10;
+    if (product.variant.toLowerCase().includes(term)) score += 5;
+    if (product.category.toLowerCase().includes(term)) score += 2;
+    if (product.searchText.includes(term)) score += 1;
+  }
+
+  if (product.searchText.includes(query)) score += 12;
+  return score;
+}
+
 function bootstrap() {
   store = new SqliteStore(config.dataFile);
   store.init();
   store.pruneProcessedMessages(config.dedupeWindowHours);
 
+  catalog = new ProductCatalog(config.productSheetPath);
+  catalog.load().catch((err) => logError('initial product catalog load error', err));
+
   const app = express();
   app.disable('x-powered-by');
   app.set('trust proxy', true);
   app.use(express.json({
-    limit: '1mb',
+    limit: '5mb',
     verify: (req, _res, buf) => {
       req.rawBody = Buffer.from(buf);
     },
@@ -145,8 +298,11 @@ function bootstrap() {
     } catch (err) {
       logError('pruneProcessedMessages error', err);
     }
+    if (config.productSheetPath) {
+      catalog.load().catch((err) => logError('scheduled product catalog load error', err));
+    }
     followupWorker().catch((err) => logError('followupWorker error', err));
-  }, 60_000);
+  }, Math.max(60_000, config.productSheetReloadMs));
 
   app.listen(Number(config.port), () => {
     logInfo(`instabot-js listening on :${config.port}`);
@@ -189,44 +345,53 @@ async function handleMessage(req, res) {
   for (const entry of entries) {
     for (const msg of entry.messaging || []) {
       const sender = msg?.sender?.id || '';
-      const text = String(msg?.message?.text || '').trim();
       const isEcho = Boolean(msg?.message?.is_echo);
       const messageId = msg?.message?.mid || '';
-      if (!sender || !text || isEcho) continue;
+      const parsed = parseIncomingMessage(msg?.message || {});
+      if (!sender || isEcho || (!parsed.text && parsed.imageUrls.length === 0)) continue;
       if (messageId && store.hasProcessedMessage(messageId)) {
         logInfo(`message skipped duplicate sender=${sender} message_id=${messageId}`);
         continue;
       }
       if (messageId) store.markMessageProcessed(messageId, sender);
       processed += 1;
-      logInfo(`message accepted (messaging) sender=${sender} text_len=${text.length}`);
-      processIncoming(sender, text).catch((err) => logError('processIncoming error', err));
+      logInfo(`message accepted (messaging) sender=${sender} text_len=${parsed.text.length} image_count=${parsed.imageUrls.length}`);
+      processIncoming(sender, parsed).catch((err) => logError('processIncoming error', err));
     }
 
     for (const change of entry.changes || []) {
       if (change?.field !== 'messages') continue;
       const sender = change?.value?.sender?.id || '';
-      const text = String(change?.value?.message?.text || '').trim();
       const messageId = change?.value?.message?.mid || '';
-      if (!sender || !text) continue;
+      const parsed = parseIncomingMessage(change?.value?.message || {});
+      if (!sender || (!parsed.text && parsed.imageUrls.length === 0)) continue;
       if (messageId && store.hasProcessedMessage(messageId)) {
         logInfo(`message skipped duplicate sender=${sender} message_id=${messageId}`);
         continue;
       }
       if (messageId) store.markMessageProcessed(messageId, sender);
       processed += 1;
-      logInfo(`message accepted (changes) sender=${sender} text_len=${text.length}`);
-      processIncoming(sender, text).catch((err) => logError('processIncoming error', err));
+      logInfo(`message accepted (changes) sender=${sender} text_len=${parsed.text.length} image_count=${parsed.imageUrls.length}`);
+      processIncoming(sender, parsed).catch((err) => logError('processIncoming error', err));
     }
   }
 
-  if (processed === 0) {
-    logInfo(`post parsed entries=${entries.length} processed_messages=${processed}`);
-  } else {
-    logInfo(`post parsed entries=${entries.length} processed_messages=${processed}`);
-  }
-
+  logInfo(`post parsed entries=${entries.length} processed_messages=${processed}`);
   return res.json({ ok: true });
+}
+
+function parseIncomingMessage(message) {
+  const text = String(message?.text || '').trim();
+  const attachments = Array.isArray(message?.attachments) ? message.attachments : [];
+  const imageUrls = attachments
+    .filter((item) => item?.type === 'image' && item?.payload?.url)
+    .map((item) => item.payload.url);
+
+  return {
+    text,
+    imageUrls,
+    attachments,
+  };
 }
 
 function verifyMetaSignature(appSecret, body, sigHeader) {
@@ -240,30 +405,51 @@ function verifyMetaSignature(appSecret, body, sigHeader) {
   return crypto.timingSafeEqual(expectedBuffer, gotBuffer);
 }
 
-async function processIncoming(senderId, userText) {
+async function processIncoming(senderId, incoming) {
   const thread = store.getThread(senderId);
   const now = new Date().toISOString();
+  const userText = incoming.text || '[Image received]';
+  const matchedProducts = catalog.search(`${incoming.text} ${incoming.imageUrls.join(' ')}`, 5);
+
   thread.senderId = senderId;
   thread.lastUserAt = now;
   thread.turns = trimTurns([
     ...(thread.turns || []),
-    { role: 'user', content: userText, timestamp: now },
+    {
+      role: 'user',
+      content: userText,
+      timestamp: now,
+      imageUrls: incoming.imageUrls,
+      matchedProductIds: matchedProducts.map((product) => product.id),
+    },
   ], config.memoryTurns);
 
-  const reply = await generateReply(thread.turns);
-  await sendIGMessage(senderId, reply);
+  const decision = await generateDecision(thread.turns, incoming, matchedProducts);
+
+  if (decision.sendImage && decision.imageUrl) {
+    await sendIGImage(senderId, decision.imageUrl, decision.reply);
+  } else {
+    await sendIGMessage(senderId, decision.reply);
+  }
 
   const botTime = new Date().toISOString();
   thread.lastBotAt = botTime;
   thread.nextFollowupAt = new Date(Date.now() + config.followupDelayMs).toISOString();
   thread.followupCount = 0;
+  thread.escalated = decision.escalate;
   thread.turns = trimTurns([
     ...thread.turns,
-    { role: 'assistant', content: reply, timestamp: botTime },
+    {
+      role: 'assistant',
+      content: decision.reply,
+      timestamp: botTime,
+      imageUrl: decision.sendImage ? decision.imageUrl : '',
+      escalate: decision.escalate,
+    },
   ], config.memoryTurns);
 
   store.saveThread(thread);
-  logInfo(`replied sender=${senderId}`);
+  logInfo(`replied sender=${senderId} escalate=${decision.escalate} send_image=${decision.sendImage}`);
 }
 
 function trimTurns(turns, n) {
@@ -271,14 +457,45 @@ function trimTurns(turns, n) {
   return turns.slice(-n);
 }
 
-async function generateReply(turns) {
+async function generateDecision(turns, incoming, matchedProducts) {
+  const fallbackReply = 'Thanks for your message! I can help with product details, availability, and next steps. What are you looking for today?';
   if (!config.openAIAPIKey) {
-    return 'Thanks for your message! I can help with product details, availability, and next steps. What are you looking for today?';
+    return { reply: fallbackReply, escalate: false, sendImage: false, imageUrl: '' };
   }
 
+  const shouldEscalate = heuristicEscalation(incoming.text);
+  const system = `${config.systemPrompt}
+You are powering an Instagram sales bot.
+Rules:
+- Reply naturally and humanly.
+- Use the supplied product catalog context instead of inventing products.
+- If the customer asks about payment, delivery, returns, refunds, or anything sensitive/unclear, set escalate=true and hand off politely.
+- If one product is a strong match and has an image URL, you may set sendImage=true.
+- Return strict JSON only with keys: reply, escalate, sendImage, chosenProductId.
+- Keep reply short (1-3 lines).
+`;
+
+  const catalogContext = matchedProducts.length
+    ? matchedProducts.map((product) => ({
+        id: product.id,
+        sku: product.sku,
+        name: product.name,
+        description: product.description,
+        price: product.price,
+        stock: product.stock,
+        variant: product.variant,
+        category: product.category,
+        imageUrl: product.primaryImageUrl,
+      }))
+    : [];
+
   const messages = [
-    { role: 'system', content: config.systemPrompt },
-    ...turns.map((turn) => ({ role: turn.role, content: turn.content })),
+    { role: 'system', content: system },
+    ...turns.flatMap((turn) => toModelMessages(turn)),
+    {
+      role: 'user',
+      content: buildUserContent(incoming, catalogContext, shouldEscalate),
+    },
   ];
 
   const response = await fetchWithTimeout('https://api.openai.com/v1/chat/completions', {
@@ -290,8 +507,9 @@ async function generateReply(turns) {
     body: JSON.stringify({
       model: config.openAIModel,
       messages,
-      temperature: 0.6,
-      max_completion_tokens: 220,
+      temperature: 0.4,
+      max_completion_tokens: 350,
+      response_format: { type: 'json_object' },
     }),
   }, config.requestTimeoutMs);
 
@@ -303,30 +521,101 @@ async function generateReply(turns) {
   const data = await response.json();
   const content = data?.choices?.[0]?.message?.content?.trim();
   if (!content) throw new Error('no choices');
-  return content;
+
+  let parsed;
+  try {
+    parsed = JSON.parse(content);
+  } catch {
+    return { reply: content, escalate: shouldEscalate, sendImage: false, imageUrl: '' };
+  }
+
+  const chosen = catalog.getById(parsed.chosenProductId) || matchedProducts[0] || null;
+  const sendImage = Boolean(config.sendProductImages && parsed.sendImage && chosen?.primaryImageUrl);
+  return {
+    reply: String(parsed.reply || fallbackReply).trim(),
+    escalate: Boolean(parsed.escalate || shouldEscalate),
+    sendImage,
+    imageUrl: sendImage ? chosen.primaryImageUrl : '',
+  };
+}
+
+function toModelMessages(turn) {
+  if (turn.role !== 'user' || !Array.isArray(turn.imageUrls) || turn.imageUrls.length === 0) {
+    return [{ role: turn.role, content: turn.content }];
+  }
+
+  const parts = [{ type: 'text', text: turn.content }];
+  for (const url of turn.imageUrls.slice(0, 2)) {
+    parts.push({ type: 'image_url', image_url: { url } });
+  }
+  return [{ role: 'user', content: parts }];
+}
+
+function buildUserContent(incoming, catalogContext, shouldEscalate) {
+  const parts = [
+    { type: 'text', text: `Customer message: ${incoming.text || '[Image only]'}\nPotential escalation by heuristic: ${shouldEscalate}\nCatalog matches: ${JSON.stringify(catalogContext)}` },
+  ];
+
+  for (const url of incoming.imageUrls.slice(0, 2)) {
+    parts.push({ type: 'image_url', image_url: { url } });
+  }
+  return parts;
+}
+
+function heuristicEscalation(text) {
+  const q = normalizeFreeText(text);
+  if (!q) return false;
+  const triggers = [
+    'refund', 'return', 'payment', 'pay', 'bank transfer', 'card issue', 'delivery delay', 'where is my order',
+    'complaint', 'cancel order', 'speak to human', 'agent', 'representative', 'problem with order',
+  ];
+  return triggers.some((term) => q.includes(term));
 }
 
 async function sendIGMessage(recipientId, text) {
-  if (!config.igPageId || !config.igPageAccessToken) {
-    throw new Error('IG_PAGE_ID or IG_PAGE_ACCESS_TOKEN missing');
-  }
-
+  if (!config.igPageId || !config.igPageAccessToken) throw new Error('IG_PAGE_ID or IG_PAGE_ACCESS_TOKEN missing');
   const recipient = String(recipientId || '').trim();
   const messageText = String(text || '').trim();
   if (!recipient) throw new Error('recipientID missing');
   if (!messageText) throw new Error('message text missing');
 
+  await callGraphApi({
+    recipient: { id: recipient },
+    message: { text: messageText },
+    messaging_type: 'RESPONSE',
+  });
+}
+
+async function sendIGImage(recipientId, imageUrl, caption = '') {
+  if (!config.igPageId || !config.igPageAccessToken) throw new Error('IG_PAGE_ID or IG_PAGE_ACCESS_TOKEN missing');
+  const recipient = String(recipientId || '').trim();
+  if (!recipient) throw new Error('recipientID missing');
+  if (!imageUrl) throw new Error('image url missing');
+
+  await callGraphApi({
+    recipient: { id: recipient },
+    message: {
+      attachment: {
+        type: 'image',
+        payload: { url: imageUrl, is_reusable: false },
+      },
+    },
+    messaging_type: 'RESPONSE',
+  });
+
+  if (caption && caption.trim()) {
+    await sendIGMessage(recipientId, caption);
+  }
+}
+
+async function callGraphApi(payload) {
   const url = new URL(`https://graph.facebook.com/v25.0/${config.igPageId}/messages`);
   url.searchParams.set('access_token', config.igPageAccessToken.trim());
 
   const response = await fetchWithTimeout(url, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({
-      recipient: { id: recipient },
-      message: { text: messageText },
-      messaging_type: 'RESPONSE',
-    }),
+    body: JSON.stringify(payload),
   }, config.requestTimeoutMs);
 
   if (!response.ok) {
@@ -355,6 +644,7 @@ async function followupWorker() {
   const now = Date.now();
   for (const thread of threads) {
     if (!thread.senderId || !thread.nextFollowupAt) continue;
+    if (thread.escalated) continue;
     if (new Date(thread.nextFollowupAt).getTime() > now) continue;
     if ((thread.followupCount || 0) >= config.followupMaxPerUser) continue;
     if (thread.lastUserAt && thread.lastBotAt && new Date(thread.lastUserAt) > new Date(thread.lastBotAt)) continue;
@@ -403,7 +693,7 @@ function handlePrivacy(_req, res) {
 <h2>Data we process</h2>
 <ul>
   <li>Instagram sender ID</li>
-  <li>Message text and timestamps</li>
+  <li>Message text, image URLs, and timestamps</li>
   <li>Webhook metadata required for message delivery and security verification</li>
 </ul>
 <h2>Purpose of processing</h2>

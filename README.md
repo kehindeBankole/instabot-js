@@ -1,32 +1,48 @@
 # instabot-js
 
-Node.js rewrite of the Instagram DM assistant, hardened for VPS deployment.
+Node.js Instagram DM assistant with SQLite memory, product-sheet integration, image-aware replies, and follow-ups.
 
-## What changed from the first port
-- SQLite persistence instead of a flat JSON file
-- duplicate webhook message detection by Meta message id
-- request timeouts for OpenAI and Graph API calls
-- quieter logging by default (`LOG_PAYLOADS=false`)
-- systemd service file for long-running VPS use
-- safer default port (`8081`) so it can sit beside the Go bot
+## Core capabilities
+- receives Instagram DM webhooks
+- replies in a human-like tone
+- remembers recent conversation context
+- loads products from a strict sheet format (Excel / Google Sheet / CSV / JSON)
+- uses product image URLs as reference material
+- can inspect inbound customer images/screenshots with a vision-capable model
+- can send product images back to the customer
+- escalates payment, delivery, returns, and unclear cases to a human
+- sends follow-ups when appropriate
 
-## Features
-- `GET /ig-webhook` for Meta webhook verification
-- `POST /ig-webhook` for Instagram messaging events
-- Signature verification via `X-Hub-Signature-256` (when `IG_APP_SECRET` is set)
-- Per-sender conversation memory in SQLite
-- Automatic follow-up worker
-- Public pages for `/`, `/health`, `/privacy`, `/data-deletion`
-- Duplicate delivery protection for webhook events
+## Product sheet
+Provide a strict structured sheet with columns like:
+- `product_name`
+- `sku`
+- `description`
+- `price`
+- `stock`
+- `variant`
+- `category`
+- `image_url`
+- `image_url_2`
+- `image_url_3`
 
-## Why not markdown for persistence?
-Markdown is fine for human notes. It is a lousy runtime datastore for a webhook bot because you need:
-- reliable structured reads/writes
-- concurrent access safety
-- duplicate detection
-- compact per-thread state updates
+The stricter the sheet, the less guesswork the model has to do.
 
-For model memory in a live bot, SQLite is the sane floor.
+## Supported sheet sources
+- local `.xlsx`
+- local `.csv`
+- local `.json`
+- remote URL to a CSV / XLSX / JSON file
+- Google Sheet exported as CSV URL
+
+Set it with:
+```bash
+PRODUCT_SHEET_PATH=/opt/instabot-js/products.xlsx
+```
+or a URL:
+```bash
+PRODUCT_SHEET_PATH=https://example.com/products.csv
+```
 
 ## Quick start
 ```bash
@@ -53,11 +69,9 @@ journalctl -u instabot-js -f
 ```
 
 ## Reverse proxy
-Put it behind Caddy or Nginx and point a subdomain to port `8081`.
-
 Example Caddy snippet:
 ```caddy
-instabotjs.example.com {
+winsta.example.com {
     reverse_proxy 127.0.0.1:8081
 }
 ```
