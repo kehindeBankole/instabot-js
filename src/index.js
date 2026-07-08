@@ -3,13 +3,14 @@ import crypto from 'node:crypto';
 import fs from 'node:fs';
 import path from 'node:path';
 import express from 'express';
+import Database from 'better-sqlite3';
 
 const config = loadConfig();
 let store;
 
 function loadConfig() {
   return {
-    port: process.env.PORT || '8080',
+    port: process.env.PORT || '8081',
     verifyToken: process.env.IG_VERIFY_TOKEN || '',
     appSecret: process.env.IG_APP_SECRET || '',
     igUserId: process.env.IG_USER_ID || '',
@@ -21,7 +22,10 @@ function loadConfig() {
     memoryTurns: parseInt(process.env.MEMORY_TURNS || '12', 10),
     followupDelayMs: parseDurationMs(process.env.FOLLOWUP_DELAY || '2h'),
     followupMaxPerUser: parseInt(process.env.FOLLOWUP_MAX_PER_USER || '1', 10),
-    dataFile: process.env.DATA_FILE || 'instabot-js.json',
+    dataFile: process.env.DATA_FILE || 'data/instabot.db',
+    requestTimeoutMs: parseInt(process.env.REQUEST_TIMEOUT_MS || '30000', 10),
+    logPayloads: String(process.env.LOG_PAYLOADS || 'false').toLowerCase() === 'true',
+    dedupeWindowHours: parseInt(process.env.DEDUPE_WINDOW_HOURS || '72', 10),
   };
 }
 
@@ -35,12 +39,89 @@ function parseDurationMs(input) {
   return amount * factors[unit];
 }
 
+class SqliteStore {
+  constructor(file) {
+    this.file = path.resolve(file);
+  }
+
+  init() {
+    fs.mkdirSync(path.dirname(this.file), { recursive: true });
+    this.db = new Database(this.file);
+    this.db.pragma('journal_mode = WAL');
+    this.db.pragma('busy_timeout = 5000');
+    this.db.exec(`
+      CREATE TABLE IF NOT EXISTS threads (
+        sender_id TEXT PRIMARY KEY,
+        state_json TEXT NOT NULL,
+        updated_at TEXT NOT NULL
+      );
+      CREATE TABLE IF NOT EXISTS processed_messages (
+        message_id TEXT PRIMARY KEY,
+        sender_id TEXT,
+        seen_at TEXT NOT NULL
+      );
+      CREATE INDEX IF NOT EXISTS idx_processed_messages_seen_at ON processed_messages(seen_at);
+    `);
+
+    this.getThreadStmt = this.db.prepare('SELECT state_json FROM threads WHERE sender_id = ?');
+    this.saveThreadStmt = this.db.prepare(`
+      INSERT INTO threads(sender_id, state_json, updated_at)
+      VALUES (?, ?, ?)
+      ON CONFLICT(sender_id) DO UPDATE SET state_json = excluded.state_json, updated_at = excluded.updated_at
+    `);
+    this.listThreadsStmt = this.db.prepare('SELECT state_json FROM threads');
+    this.seenMessageStmt = this.db.prepare('SELECT 1 FROM processed_messages WHERE message_id = ?');
+    this.markMessageStmt = this.db.prepare('INSERT INTO processed_messages(message_id, sender_id, seen_at) VALUES (?, ?, ?)');
+    this.pruneMessagesStmt = this.db.prepare('DELETE FROM processed_messages WHERE seen_at < ?');
+  }
+
+  getThread(senderId) {
+    const row = this.getThreadStmt.get(senderId);
+    if (!row) {
+      return {
+        senderId,
+        turns: [],
+        lastUserAt: null,
+        lastBotAt: null,
+        followupCount: 0,
+        nextFollowupAt: null,
+      };
+    }
+    return JSON.parse(row.state_json);
+  }
+
+  saveThread(thread) {
+    this.saveThreadStmt.run(thread.senderId, JSON.stringify(thread), new Date().toISOString());
+  }
+
+  listThreads() {
+    return this.listThreadsStmt.all().map((row) => JSON.parse(row.state_json));
+  }
+
+  hasProcessedMessage(messageId) {
+    return Boolean(this.seenMessageStmt.get(messageId));
+  }
+
+  markMessageProcessed(messageId, senderId) {
+    this.markMessageStmt.run(messageId, senderId, new Date().toISOString());
+  }
+
+  pruneProcessedMessages(windowHours) {
+    const cutoff = new Date(Date.now() - windowHours * 60 * 60 * 1000).toISOString();
+    this.pruneMessagesStmt.run(cutoff);
+  }
+}
+
 function bootstrap() {
-  store = new JsonStore(config.dataFile);
+  store = new SqliteStore(config.dataFile);
   store.init();
+  store.pruneProcessedMessages(config.dedupeWindowHours);
 
   const app = express();
+  app.disable('x-powered-by');
+  app.set('trust proxy', true);
   app.use(express.json({
+    limit: '1mb',
     verify: (req, _res, buf) => {
       req.rawBody = Buffer.from(buf);
     },
@@ -51,81 +132,32 @@ function bootstrap() {
   app.get('/privacy', handlePrivacy);
   app.get('/data-deletion', handleDataDeletion);
   app.all('/ig-webhook', async (req, res) => {
-    console.log(`webhook hit method=${req.method} path=${req.path} ua=${JSON.stringify(req.get('user-agent') || '')} remote=${req.ip}`);
+    logInfo(`webhook hit method=${req.method} path=${req.path} ua=${JSON.stringify(req.get('user-agent') || '')} remote=${req.ip}`);
 
-    if (req.method === 'GET') {
-      return handleVerify(req, res);
-    }
-
-    if (req.method !== 'POST') {
-      return res.status(405).send('method not allowed');
-    }
-
+    if (req.method === 'GET') return handleVerify(req, res);
+    if (req.method !== 'POST') return res.status(405).send('method not allowed');
     return handleMessage(req, res);
   });
 
   setInterval(() => {
-    followupWorker().catch((err) => console.error('followupWorker error:', err));
+    try {
+      store.pruneProcessedMessages(config.dedupeWindowHours);
+    } catch (err) {
+      logError('pruneProcessedMessages error', err);
+    }
+    followupWorker().catch((err) => logError('followupWorker error', err));
   }, 60_000);
 
-  app.listen(config.port, () => {
-    console.log(`instabot-js listening on :${config.port}`);
+  app.listen(Number(config.port), () => {
+    logInfo(`instabot-js listening on :${config.port}`);
   });
-}
-
-class JsonStore {
-  constructor(file) {
-    this.file = path.resolve(file);
-    this.state = { threads: {} };
-  }
-
-  init() {
-    fs.mkdirSync(path.dirname(this.file), { recursive: true });
-    if (!fs.existsSync(this.file)) {
-      this.flush();
-      return;
-    }
-    try {
-      this.state = JSON.parse(fs.readFileSync(this.file, 'utf8'));
-      if (!this.state.threads || typeof this.state.threads !== 'object') {
-        this.state.threads = {};
-      }
-    } catch {
-      this.state = { threads: {} };
-      this.flush();
-    }
-  }
-
-  flush() {
-    fs.writeFileSync(this.file, JSON.stringify(this.state, null, 2));
-  }
-
-  getThread(senderId) {
-    return this.state.threads[senderId] || {
-      senderId,
-      turns: [],
-      lastUserAt: null,
-      lastBotAt: null,
-      followupCount: 0,
-      nextFollowupAt: null,
-    };
-  }
-
-  saveThread(thread) {
-    this.state.threads[thread.senderId] = thread;
-    this.flush();
-  }
-
-  listThreads() {
-    return Object.values(this.state.threads);
-  }
 }
 
 function handleVerify(req, res) {
   const mode = req.query['hub.mode'];
   const token = req.query['hub.verify_token'];
   const challenge = req.query['hub.challenge'];
-  console.log(`verify attempt mode=${JSON.stringify(mode || '')} token_match=${token === config.verifyToken} challenge_len=${String(challenge || '').length}`);
+  logInfo(`verify attempt mode=${JSON.stringify(mode || '')} token_match=${token === config.verifyToken} challenge_len=${String(challenge || '').length}`);
 
   if (mode === 'subscribe' && token === config.verifyToken) {
     return res.status(200).send(challenge);
@@ -138,13 +170,17 @@ async function handleMessage(req, res) {
   const sig = req.get('X-Hub-Signature-256') || '';
 
   if (config.appSecret && !verifyMetaSignature(config.appSecret, bodyBuffer, sig)) {
-    console.log(`post rejected invalid signature sig_present=${Boolean(sig)} body_len=${bodyBuffer.length}`);
+    logInfo(`post rejected invalid signature sig_present=${Boolean(sig)} body_len=${bodyBuffer.length}`);
     return res.status(401).send('invalid signature');
   }
 
-  let preview = bodyBuffer.toString('utf8');
-  if (preview.length > 2000) preview = `${preview.slice(0, 2000)}...`;
-  console.log(`post received sig_present=${Boolean(sig)} body_len=${bodyBuffer.length} payload=${preview}`);
+  if (config.logPayloads) {
+    let preview = bodyBuffer.toString('utf8');
+    if (preview.length > 2000) preview = `${preview.slice(0, 2000)}...`;
+    logInfo(`post received sig_present=${Boolean(sig)} body_len=${bodyBuffer.length} payload=${preview}`);
+  } else {
+    logInfo(`post received sig_present=${Boolean(sig)} body_len=${bodyBuffer.length}`);
+  }
 
   const incoming = req.body || {};
   const entries = Array.isArray(incoming.entry) ? incoming.entry : [];
@@ -155,29 +191,39 @@ async function handleMessage(req, res) {
       const sender = msg?.sender?.id || '';
       const text = String(msg?.message?.text || '').trim();
       const isEcho = Boolean(msg?.message?.is_echo);
+      const messageId = msg?.message?.mid || '';
       if (!sender || !text || isEcho) continue;
+      if (messageId && store.hasProcessedMessage(messageId)) {
+        logInfo(`message skipped duplicate sender=${sender} message_id=${messageId}`);
+        continue;
+      }
+      if (messageId) store.markMessageProcessed(messageId, sender);
       processed += 1;
-      console.log(`message accepted (messaging) sender=${sender} text_len=${text.length}`);
-      processIncoming(sender, text).catch((err) => console.error('processIncoming error:', err));
+      logInfo(`message accepted (messaging) sender=${sender} text_len=${text.length}`);
+      processIncoming(sender, text).catch((err) => logError('processIncoming error', err));
     }
 
     for (const change of entry.changes || []) {
       if (change?.field !== 'messages') continue;
       const sender = change?.value?.sender?.id || '';
       const text = String(change?.value?.message?.text || '').trim();
+      const messageId = change?.value?.message?.mid || '';
       if (!sender || !text) continue;
+      if (messageId && store.hasProcessedMessage(messageId)) {
+        logInfo(`message skipped duplicate sender=${sender} message_id=${messageId}`);
+        continue;
+      }
+      if (messageId) store.markMessageProcessed(messageId, sender);
       processed += 1;
-      console.log(`message accepted (changes) sender=${sender} text_len=${text.length}`);
-      processIncoming(sender, text).catch((err) => console.error('processIncoming error:', err));
+      logInfo(`message accepted (changes) sender=${sender} text_len=${text.length}`);
+      processIncoming(sender, text).catch((err) => logError('processIncoming error', err));
     }
   }
 
   if (processed === 0) {
-    let rawPreview = JSON.stringify(incoming);
-    if (rawPreview.length > 1200) rawPreview = `${rawPreview.slice(0, 1200)}...`;
-    console.log(`post parsed entries=${entries.length} processed_messages=${processed} raw_preview=${rawPreview}`);
+    logInfo(`post parsed entries=${entries.length} processed_messages=${processed}`);
   } else {
-    console.log(`post parsed entries=${entries.length} processed_messages=${processed}`);
+    logInfo(`post parsed entries=${entries.length} processed_messages=${processed}`);
   }
 
   return res.json({ ok: true });
@@ -217,7 +263,7 @@ async function processIncoming(senderId, userText) {
   ], config.memoryTurns);
 
   store.saveThread(thread);
-  console.log(`replied sender=${senderId}`);
+  logInfo(`replied sender=${senderId}`);
 }
 
 function trimTurns(turns, n) {
@@ -235,7 +281,7 @@ async function generateReply(turns) {
     ...turns.map((turn) => ({ role: turn.role, content: turn.content })),
   ];
 
-  const response = await fetch('https://api.openai.com/v1/chat/completions', {
+  const response = await fetchWithTimeout('https://api.openai.com/v1/chat/completions', {
     method: 'POST',
     headers: {
       Authorization: `Bearer ${config.openAIAPIKey}`,
@@ -247,7 +293,7 @@ async function generateReply(turns) {
       temperature: 0.6,
       max_completion_tokens: 220,
     }),
-  });
+  }, config.requestTimeoutMs);
 
   if (!response.ok) {
     const text = await response.text();
@@ -273,7 +319,7 @@ async function sendIGMessage(recipientId, text) {
   const url = new URL(`https://graph.facebook.com/v25.0/${config.igPageId}/messages`);
   url.searchParams.set('access_token', config.igPageAccessToken.trim());
 
-  const response = await fetch(url, {
+  const response = await fetchWithTimeout(url, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({
@@ -281,11 +327,21 @@ async function sendIGMessage(recipientId, text) {
       message: { text: messageText },
       messaging_type: 'RESPONSE',
     }),
-  });
+  }, config.requestTimeoutMs);
 
   if (!response.ok) {
     const body = await response.text();
     throw new Error(`graph status=${response.status} body=${body}`);
+  }
+}
+
+async function fetchWithTimeout(url, options, timeoutMs) {
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), timeoutMs);
+  try {
+    return await fetch(url, { ...options, signal: controller.signal });
+  } finally {
+    clearTimeout(timeout);
   }
 }
 
@@ -315,17 +371,15 @@ async function followupWorker() {
         { role: 'assistant', content: msg, timestamp: nowIso },
       ], config.memoryTurns);
       store.saveThread(thread);
-      console.log(`followup sent sender=${thread.senderId}`);
+      logInfo(`followup sent sender=${thread.senderId}`);
     } catch (err) {
-      console.error('followup send error:', err);
+      logError('followup send error', err);
     }
   }
 }
 
 function handleHome(req, res) {
-  if (req.path !== '/') {
-    return res.status(404).send('not found');
-  }
+  if (req.path !== '/') return res.status(404).send('not found');
   res.type('html').send(`<!doctype html>
 <html><head><meta charset="utf-8"><title>InstaBot JS</title></head>
 <body style="font-family:Arial,sans-serif;max-width:760px;margin:40px auto;line-height:1.6;padding:0 16px;">
@@ -386,6 +440,14 @@ function handleDataDeletion(_req, res) {
 </ol>
 <p>If you are contacting from within Instagram, you may also send: <strong>DELETE MY DATA</strong> in DM to trigger manual review.</p>
 </body></html>`);
+}
+
+function logInfo(message) {
+  console.log(`${new Date().toISOString()} ${message}`);
+}
+
+function logError(message, err) {
+  console.error(`${new Date().toISOString()} ${message}:`, err instanceof Error ? err.message : err);
 }
 
 bootstrap();

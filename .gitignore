@@ -1,3 +1,6 @@
 node_modules/
 .env
-instabot-js.json
+data/
+*.db
+*.db-shm
+*.db-wal
