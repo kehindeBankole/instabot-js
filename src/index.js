@@ -1,6 +1,7 @@
 import 'dotenv/config';
 import crypto from 'node:crypto';
 import fs from 'node:fs';
+import os from 'node:os';
 import path from 'node:path';
 import express from 'express';
 import Database from 'better-sqlite3';
@@ -463,6 +464,15 @@ async function generateDecision(turns, incoming, matchedProducts) {
     return { reply: fallbackReply, escalate: false, sendImage: false, imageUrl: '' };
   }
 
+  const localImageDataUrls = [];
+  for (const url of incoming.imageUrls.slice(0, 2)) {
+    try {
+      localImageDataUrls.push(await downloadImageAsDataUrl(url));
+    } catch (err) {
+      logError(`image download failed url=${url}`, err);
+    }
+  }
+
   const shouldEscalate = heuristicEscalation(incoming.text);
   const system = `${config.systemPrompt}
 You are powering an Instagram sales bot.
@@ -494,7 +504,7 @@ Rules:
     ...turns.flatMap((turn) => toModelMessages(turn)),
     {
       role: 'user',
-      content: buildUserContent(incoming, catalogContext, shouldEscalate),
+      content: buildUserContent(incoming, catalogContext, shouldEscalate, localImageDataUrls),
     },
   ];
 
@@ -551,12 +561,12 @@ function toModelMessages(turn) {
   return [{ role: 'user', content: parts }];
 }
 
-function buildUserContent(incoming, catalogContext, shouldEscalate) {
+function buildUserContent(incoming, catalogContext, shouldEscalate, localImageDataUrls = []) {
   const parts = [
     { type: 'text', text: `Customer message: ${incoming.text || '[Image only]'}\nPotential escalation by heuristic: ${shouldEscalate}\nCatalog matches: ${JSON.stringify(catalogContext)}` },
   ];
 
-  for (const url of incoming.imageUrls.slice(0, 2)) {
+  for (const url of localImageDataUrls.slice(0, 2)) {
     parts.push({ type: 'image_url', image_url: { url } });
   }
   return parts;
@@ -570,6 +580,33 @@ function heuristicEscalation(text) {
     'complaint', 'cancel order', 'speak to human', 'agent', 'representative', 'problem with order',
   ];
   return triggers.some((term) => q.includes(term));
+}
+
+async function downloadImageAsDataUrl(url) {
+  const response = await fetchWithTimeout(url, {
+    headers: {
+      'User-Agent': 'Mozilla/5.0 InstaBotJS/1.0',
+    },
+  }, config.requestTimeoutMs);
+
+  if (!response.ok) {
+    throw new Error(`image download status=${response.status}`);
+  }
+
+  const contentType = response.headers.get('content-type') || 'image/jpeg';
+  const arrayBuffer = await response.arrayBuffer();
+  const buffer = Buffer.from(arrayBuffer);
+
+  const tempDir = path.join(os.tmpdir(), 'instabot-js-images');
+  fs.mkdirSync(tempDir, { recursive: true });
+  const tempPath = path.join(tempDir, `${Date.now()}-${crypto.randomUUID()}`);
+  fs.writeFileSync(tempPath, buffer);
+  try {
+    const base64 = buffer.toString('base64');
+    return `data:${contentType};base64,${base64}`;
+  } finally {
+    try { fs.unlinkSync(tempPath); } catch {}
+  }
 }
 
 async function sendIGMessage(recipientId, text) {
