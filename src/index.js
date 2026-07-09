@@ -550,15 +550,9 @@ Rules:
 }
 
 function toModelMessages(turn) {
-  if (turn.role !== 'user' || !Array.isArray(turn.imageUrls) || turn.imageUrls.length === 0) {
-    return [{ role: turn.role, content: turn.content }];
-  }
-
-  const parts = [{ type: 'text', text: turn.content }];
-  for (const url of turn.imageUrls.slice(0, 2)) {
-    parts.push({ type: 'image_url', image_url: { url } });
-  }
-  return [{ role: 'user', content: parts }];
+  // Do NOT replay raw Instagram CDN image URLs from history back into the model.
+  // They are temporary/signed and often rejected by the API. Keep history textual.
+  return [{ role: turn.role, content: turn.content }];
 }
 
 function buildUserContent(incoming, catalogContext, shouldEscalate, localImageDataUrls = []) {
